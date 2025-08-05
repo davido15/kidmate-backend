@@ -1,0 +1,25 @@
+{
+	"folders": [
+		{
+			"path": "../../../../../Applications/MAMP/htdocs/Pozy"
+		},
+		{
+			"path": "../../../pozyapp/node_modules"
+		},
+		{
+			"path": "../../../pozyapp"
+		},
+		{
+			"path": "../../../pozyai"
+		},
+		{
+			"path": "../../../elevenlabs-examples"
+		},
+		{
+			"path": "../../../Documents/GitHub/paylink"
+		},
+		{
+			"path": ".."
+		}
+	]
+}
