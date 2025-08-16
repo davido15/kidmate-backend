@@ -59,6 +59,10 @@ class PickupPerson(db.Model):
     image = db.Column(db.String(255))
     pickup_id = db.Column(db.String(100))
     kid_id = db.Column(db.Integer, db.ForeignKey('kids.id'))
+    phone = db.Column(db.String(20))
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, server_default=func.current_timestamp())
+    updated_at = db.Column(db.DateTime, server_default=func.current_timestamp(), onupdate=func.current_timestamp())
 
 class PickupJourney(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -67,6 +71,9 @@ class PickupJourney(db.Model):
     child_id = db.Column(db.String(36), nullable=False)
     pickup_person_id = db.Column(db.String(36), nullable=False)
     status = db.Column(db.String(20), nullable=False)
+    dropoff_location = db.Column(db.String(255))
+    dropoff_latitude = db.Column(db.Float)
+    dropoff_longitude = db.Column(db.Float)
     timestamp = db.Column(db.DateTime, server_default=func.current_timestamp())
 
 class Payment(db.Model):
@@ -115,4 +122,74 @@ class Complaint(db.Model):
     admin_notes = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, server_default=func.current_timestamp())
     updated_at = db.Column(db.DateTime, server_default=func.current_timestamp(), onupdate=func.current_timestamp())
+
+
+class AdminUser(db.Model):
+    __tablename__ = 'admin_users'
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(100), unique=True, nullable=False)
+    email = db.Column(db.String(100), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    role = db.Column(db.String(50), default="admin")
+    created_at = db.Column(db.DateTime, server_default=func.current_timestamp())
     updated_at = db.Column(db.DateTime, server_default=func.current_timestamp(), onupdate=func.current_timestamp())
+
+    def set_password(self, password):
+        from werkzeug.security import generate_password_hash
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        from werkzeug.security import check_password_hash
+        return check_password_hash(self.password_hash, password)
+
+
+class Term(db.Model):
+    __tablename__ = 'terms'
+    id = db.Column(db.Integer, primary_key=True)
+    term_code = db.Column(db.String(20), unique=True, nullable=False)
+    term_name = db.Column(db.String(100), nullable=False)
+    start_date = db.Column(db.Date, nullable=False)
+    end_date = db.Column(db.Date, nullable=False)
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, server_default=func.current_timestamp())
+    updated_at = db.Column(db.DateTime, server_default=func.current_timestamp(), onupdate=func.current_timestamp())
+
+
+class Subject(db.Model):
+    __tablename__ = 'subjects'
+    id = db.Column(db.Integer, primary_key=True)
+    subject_code = db.Column(db.String(20), unique=True, nullable=False)
+    subject_name = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.Text)
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, server_default=func.current_timestamp())
+    updated_at = db.Column(db.DateTime, server_default=func.current_timestamp(), onupdate=func.current_timestamp())
+
+
+class Class(db.Model):
+    __tablename__ = 'classes'
+    id = db.Column(db.Integer, primary_key=True)
+    class_code = db.Column(db.String(20), unique=True, nullable=False)
+    class_name = db.Column(db.String(100), nullable=False)
+    grade_level = db.Column(db.String(20))
+    teacher_name = db.Column(db.String(100))
+    room_number = db.Column(db.String(20))
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, server_default=func.current_timestamp())
+    updated_at = db.Column(db.DateTime, server_default=func.current_timestamp(), onupdate=func.current_timestamp())
+
+
+class Grade(db.Model):
+    __tablename__ = 'grades'
+    id = db.Column(db.Integer, primary_key=True)
+    kid_id = db.Column(db.Integer, db.ForeignKey('kids.id'), nullable=False)
+    subject = db.Column(db.String(100), nullable=False)
+    grade = db.Column(db.String(10), nullable=False)
+    remarks = db.Column(db.String(255))
+    comments = db.Column(db.Text)
+    date_recorded = db.Column(db.Date, nullable=False)
+    created_at = db.Column(db.DateTime, server_default=func.current_timestamp())
+    updated_at = db.Column(db.DateTime, server_default=func.current_timestamp(), onupdate=func.current_timestamp())
+
+    # Relationship
+    kid = db.relationship('Kid', backref='grades')

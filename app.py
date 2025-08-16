@@ -1,42 +1,116 @@
 import os
+import logging
+from logging.handlers import RotatingFileHandler
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask_jwt_extended import JWTManager, create_access_token, create_refresh_token, jwt_required, get_jwt_identity, get_jwt
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 from flask_migrate import Migrate
 import requests
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# Load environment variables
+# Load environment variables from .env file
 load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app)
 
+# Configure logging for production
+if not app.debug:
+    # Create logs directory if it doesn't exist
+    if not os.path.exists('logs'):
+        os.mkdir('logs')
+    
+    # Configure file handler for production logging
+    file_handler = RotatingFileHandler('logs/kidmate.log', maxBytes=10240, backupCount=10)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
+    ))
+    file_handler.setLevel(logging.INFO)
+    app.logger.addHandler(file_handler)
+    
+    # Set app logger level
+    app.logger.setLevel(logging.INFO)
+    app.logger.info('KidMate startup')
+
 # Configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root:root@localhost:8889/kidmate_db'
+# Load environment variables (no defaults)
+DATABASE_URL = os.getenv('DATABASE_URL_LOCAL')
+SECRET_KEY = os.getenv('SECRET_KEY')
+JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY')
+
+
+
+# Validate required environment variables
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable is required")
+if not SECRET_KEY:
+    raise ValueError("SECRET_KEY environment variable is required")
+if not JWT_SECRET_KEY:
+    raise ValueError("JWT_SECRET_KEY environment variable is required")
+
+# Database configuration
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JWT_SECRET_KEY'] = 'your-secret-key'
+
+# Security configuration
+app.config['SECRET_KEY'] = SECRET_KEY
+app.config['JWT_SECRET_KEY'] = JWT_SECRET_KEY
+
+# Upload configuration
 app.config['UPLOAD_FOLDER'] = 'uploads/images'
 
 # JWT Configuration
 app.config['JWT_TOKEN_LOCATION'] = ['headers']
 app.config['JWT_HEADER_NAME'] = 'Authorization'
 app.config['JWT_HEADER_TYPE'] = 'Bearer'
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(minutes=30)  # Set token expiration to 30 minutes
+app.config['JWT_REFRESH_TOKEN_EXPIRES'] = timedelta(days=30)  # Set refresh token expiration to 30 days
 
 # Ensure upload directory exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # Initialize extensions
-from models import PickupJourney, db, User, Parent, Kid, PickupPerson, Payment, Attendance, Complaint  # Import db from models.py
+from models import PickupJourney, db, User, Parent, Kid, PickupPerson, Payment, Attendance, Complaint, AdminUser, Term, Subject, Class, Grade  # Import db from models.py
 db.init_app(app)
 migrate = Migrate(app, db)
 jwt = JWTManager(app)
+
+# Request logging middleware
+@app.before_request
+def log_request():
+    """Log all incoming requests"""
+    app.logger.info("Request: {} {} from IP: {} - User-Agent: {}".format(
+        request.method, 
+        request.url, 
+        request.remote_addr,
+        request.user_agent.string if request.user_agent else 'Unknown'
+    ))
+
+@app.after_request
+def log_response(response):
+    """Log all responses"""
+    app.logger.info("Response: {} {} - Status: {}".format(
+        request.method, 
+        request.url, 
+        response.status_code
+    ))
+    return response
+
+@app.errorhandler(Exception)
+def log_error(error):
+    """Log all unhandled exceptions"""
+    app.logger.error("Unhandled exception: {} - URL: {} - Method: {}".format(
+        str(error), 
+        request.url, 
+        request.method
+    ))
+    return jsonify({"error": "Internal server error"}), 500
 
 # --- Routes ---
 
@@ -52,10 +126,12 @@ FINAL_STATUSES = ['completed', 'cancelled']
 
 @app.route('/')
 def home():
+    app.logger.info("Home endpoint accessed")
     return jsonify({'message': 'Hello World'})
 
 @app.route('/test')
 def test():
+    app.logger.info("Test endpoint accessed")
     return jsonify({'message': 'Backend is working', 'timestamp': datetime.now().isoformat()})
 
 
@@ -64,16 +140,12 @@ def test():
 def register_user():
     try:
         # Log the incoming request
-        print("=== REGISTER API REQUEST ===")
-        print(f"Request Method: {request.method}")
-        print(f"Request URL: {request.url}")
-        print(f"Request Headers: {dict(request.headers)}")
-        print(f"Request IP: {request.remote_addr}")
-        print(f"Request User Agent: {request.user_agent}")
+        app.logger.info("Register API request received from IP: {}".format(request.remote_addr))
         
         data = request.get_json()
-        print(f"Request Body: {data}")
-        print("==========================")
+        if not data:
+            app.logger.warning("Register request with no JSON data")
+            return jsonify({"msg": "Invalid request data"}), 400
 
         phone = data.get('phone')
         password = data.get('password')
@@ -81,66 +153,62 @@ def register_user():
         email = data.get('email')
         role = data.get('role', 'Parent')
 
-        print(f"Extracted Data:")
-        print(f"  - Phone: {phone}")
-        print(f"  - Name: {name}")
-        print(f"  - Email: {email}")
-        print(f"  - Role: {role}")
-        print(f"  - Password: {'*' * len(password) if password else 'None'}")
+        app.logger.info("Registration attempt for phone: {}, email: {}, role: {}".format(phone, email, role))
 
         # Validate required fields
         if not phone or not password:
-            print("❌ VALIDATION ERROR: Phone and password are required")
+            app.logger.warning("Registration failed: Missing phone or password")
             return jsonify({"msg": "Phone and password are required"}), 400
 
         # Check if user already exists by phone
         existing_user = User.query.filter_by(phone=phone).first()
         if existing_user:
-            print(f"❌ USER EXISTS ERROR: User with phone {phone} already exists")
+            app.logger.warning("Registration failed: User with phone {} already exists".format(phone))
             return jsonify({"msg": "User already exists"}), 400
 
-        print("✅ Validation passed, creating new user...")
+        app.logger.info("Validation passed, creating new user")
 
         # Create new user
         user = User(name=name, phone=phone, email=email)
-        user.set_password(password)  # Make sure this hashes the password internally
-        user.set_role(role)          # Assign role if you have roles implemented
+        user.set_password(password)
+        user.set_role(role)
 
-        print(f"✅ User object created with ID: {user.id}")
+        app.logger.info("User object created with ID: {}".format(user.id))
 
         # Save user to DB
-        print("💾 Saving user to database...")
         db.session.add(user)
         db.session.commit()
-        print(f"✅ User saved successfully with ID: {user.id}")
+        app.logger.info("User saved successfully with ID: {}".format(user.id))
 
-        # Create JWT token with user id as identity
-        print("🔑 Creating JWT token...")
-        token = create_access_token(identity={"id": user.id, "name": user.name, "role": user.role})
-        print(f"✅ JWT token created for user: {user.name}")
+        # Create JWT access and refresh tokens with user id as identity
+        access_token = create_access_token(identity={"id": user.id, "name": user.name, "role": user.role})
+        refresh_token = create_refresh_token(identity={"id": user.id, "name": user.name, "role": user.role})
+        app.logger.info("JWT tokens created for user: {}".format(user.name))
         
-        response_data = {"token": token}
-        print(f"📤 Sending response: {response_data}")
-        print("=== REGISTER API REQUEST COMPLETED ===")
+        response_data = {
+            "token": access_token,
+            "refresh_token": refresh_token
+        }
+        app.logger.info("Registration completed successfully for user ID: {}".format(user.id))
         
         return jsonify(response_data), 201
         
     except Exception as e:
-        print(f"❌ ERROR in register_user: {str(e)}")
-        print(f"❌ Error type: {type(e).__name__}")
+        app.logger.error("Error in register_user: {} - Type: {}".format(str(e), type(e).__name__))
         import traceback
-        print(f"❌ Full traceback: {traceback.format_exc()}")
-        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+        app.logger.error("Full traceback: {}".format(traceback.format_exc()))
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route('/update_status', methods=['POST'])
 def update_status():
     data = request.get_json()
 
     # Log the incoming request data
-    print("/update_status request data:", data)
+    app.logger.info("Update status request received for pickup_id: {}".format(data.get('pickup_id') if data else 'None'))
 
     required_fields = ['pickup_id', 'parent_id', 'child_id', 'pickup_person_id', 'status']
     if not all(field in data for field in required_fields):
+        app.logger.warning("Update status failed: Missing required fields")
         return jsonify({'error': 'Missing required fields'}), 400
 
     new_status = data['status']
@@ -155,32 +223,39 @@ def update_status():
     previous_status = latest_entry.status if latest_entry else None
 
     # Log the status transition
-    print(f"Previous status: {previous_status}, New status: {new_status}")
+    app.logger.info("Status transition for pickup_id {}: {} -> {}".format(pickup_id, previous_status, new_status))
 
     if new_status == 'cancelled':
         if previous_status == 'completed':
+            app.logger.warning("Cannot cancel completed journey for pickup_id: {}".format(pickup_id))
             return jsonify({'error': 'Cannot cancel a completed journey'}), 400
     elif previous_status in FINAL_STATUSES:
-        return jsonify({'error': f'Cannot update status after journey is {previous_status}'}), 400
+        app.logger.warning("Cannot update status after journey is {} for pickup_id: {}".format(previous_status, pickup_id))
+        return jsonify({'error': 'Cannot update status after journey is {}'.format(previous_status)}), 400
     elif SEQUENTIAL_STATUS_FLOW.get(previous_status) != new_status:
         expected_next = SEQUENTIAL_STATUS_FLOW.get(previous_status)
+        app.logger.warning("Invalid status transition for pickup_id {}: {} -> {} (expected: {})".format(pickup_id, previous_status, new_status, expected_next))
         return jsonify({
-            'error': f'Invalid status transition. Current: {previous_status or "none"}, expected: {expected_next}, received: {new_status}'
+            'error': 'Invalid status transition. Current: {}, expected: {}, received: {}'.format(previous_status or "none", expected_next, new_status)
         }), 400
 
-    # Log status
+    # Create journey record
     journey = PickupJourney(
         pickup_id=pickup_id,
         parent_id=data['parent_id'],
         child_id=data['child_id'],
         pickup_person_id=data['pickup_person_id'],
-        status=new_status
+        status=new_status,
+        dropoff_location=data.get('dropoff_location'),
+        dropoff_latitude=float(data.get('dropoff_latitude')) if data.get('dropoff_latitude') else None,
+        dropoff_longitude=float(data.get('dropoff_longitude')) if data.get('dropoff_longitude') else None
     )
 
     db.session.add(journey)
     db.session.commit()
 
-    return jsonify({'message': f'Status updated to "{new_status}" for pickup {pickup_id}'}), 200
+    app.logger.info("Status updated successfully for pickup_id {}: {}".format(pickup_id, new_status))
+    return jsonify({'message': 'Status updated to "{}" for pickup {}'.format(new_status, pickup_id)}), 200
 
 
 
@@ -190,14 +265,21 @@ def login_user():
     email = data.get('email')
     password = data.get('password')
 
+    app.logger.info("Login attempt for email: {}".format(email))
+
     user = User.query.filter_by(email=email).first()
     if not user or not user.check_password(password):
+        app.logger.warning("Login failed for email: {} - Invalid credentials".format(email))
         return jsonify({"error": "Invalid credentials"}), 401
 
-    # Create token with email as identity (string)
-    token = create_access_token(identity=user.email)
+    # Create access and refresh tokens with email as identity (string)
+    access_token = create_access_token(identity=user.email)
+    refresh_token = create_refresh_token(identity=user.email)
+    app.logger.info("Login successful for user: {} (ID: {})".format(user.name, user.id))
+    
     return jsonify({
-        "token": token,
+        "token": access_token,
+        "refresh_token": refresh_token,
         "user": {
             "id": user.id,
             "name": user.name,
@@ -207,14 +289,43 @@ def login_user():
     }), 200
 
 
+@app.route('/api/refresh', methods=['POST'])
+@jwt_required()
+def refresh_token():
+    """Refresh access token using refresh token"""
+    try:
+        jwt_data = get_jwt()
+        if jwt_data.get('type') != 'refresh':
+            app.logger.warning("Invalid token type for refresh")
+            return jsonify({"error": "Invalid token type"}), 401
+            
+        current_user = get_jwt_identity()
+        app.logger.info("Token refresh requested for user: {}".format(current_user))
+        
+        # Create new access token
+        new_access_token = create_access_token(identity=current_user)
+        app.logger.info("New access token created for user: {}".format(current_user))
+        
+        return jsonify({
+            "token": new_access_token
+        }), 200
+        
+    except Exception as e:
+        app.logger.error("Error refreshing token: {} - User: {}".format(str(e), current_user))
+        return jsonify({"error": "Token refresh failed"}), 500
+
+
 @app.route('/api/me', methods=['GET'])
 @jwt_required()
 def get_user_info():
     try:
         current_user_email = get_jwt_identity()
+        app.logger.info("User info request for email: {}".format(current_user_email))
+        
         user = User.query.filter_by(email=current_user_email).first()
         
         if not user:
+            app.logger.warning("User not found for email: {}".format(current_user_email))
             return jsonify({"error": "User not found"}), 404
         
         # Get parent information if user is linked to a parent
@@ -230,6 +341,7 @@ def get_user_info():
                 'relationship': parent.relationship
             }
         
+        app.logger.info("User info retrieved successfully for user: {} (ID: {})".format(user.name, user.id))
         return jsonify({
             "success": True,
             "user": {
@@ -244,11 +356,20 @@ def get_user_info():
         })
         
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        app.logger.error("Error in get_user_info: {} - Email: {}".format(str(e), current_user_email))
+        return jsonify({"error": "Internal server error"}), 500
 
-def save_image(file):
+def save_image(file, parent_id=None, kid_name=None, timestamp=None):
     if file:
-        filename = secure_filename(file.filename)
+        if parent_id and kid_name and timestamp:
+            # For pickup uploads, create custom filename
+            file_extension = os.path.splitext(file.filename)[1]
+            filename = f"pickup_parent{parent_id}_{kid_name}_{timestamp}{file_extension}"
+            filename = secure_filename(filename)
+        else:
+            # For other uploads, use original filename
+            filename = secure_filename(file.filename)
+        
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(file_path)
         return file_path
@@ -290,7 +411,7 @@ def link_parent_to_user():
         db.session.commit()
         
         return jsonify({
-            "message": f"Parent {parent.name} linked to user {user.name} ({user_email})",
+            "message": "Parent {} linked to user {} ({})".format(parent.name, user.name, user_email),
             "parent_id": parent.id,
             "user_email": user_email
         }), 200
@@ -357,15 +478,29 @@ def assign_pickup():
         data = request.form
         image_file = request.files.get('image')
 
-        app.logger.debug(f"Received form data: {data}")
-        app.logger.debug(f"Received image file: {image_file}")
+        app.logger.debug("Received form data: {}".format(data))
+        app.logger.debug("Received image file: {}".format(image_file))
 
         # Assign defaults
         name = data.get('name', 'Unknown Person')
         pickup_id = data.get('pickup_id', '1234')
         kid_id = data.get('kid_id', '5')
+        phone = data.get('phone', '')
 
-        image_path = save_image(image_file)
+        # Get kid and parent information for filename
+        kid = Kid.query.get(kid_id)
+        if kid:
+            parent_id = kid.parent_id
+            kid_name = kid.name
+        else:
+            parent_id = 'unknown'
+            kid_name = 'unknown'
+
+        # Generate timestamp for filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Save image with custom naming
+        image_path = save_image(image_file, parent_id, kid_name, timestamp)
 
         pickup_uuid = str(uuid.uuid4())
 
@@ -374,22 +509,88 @@ def assign_pickup():
             name=name,
             pickup_id=pickup_id,
             kid_id=kid_id,
-            image=image_path
+            phone=phone,
+            image=image_path,
+            is_active=True
         )
 
         db.session.add(person)
         db.session.commit()
 
-        pickup_url = f"https://5d4c3ae2bc3e.ngrok-free.app/pickup/{pickup_uuid}"
+        pickup_url = "https://bdf1812b29eb.ngrok-free.app/pickup/{}".format(pickup_uuid)
 
-        app.logger.info(f"Pickup person added with UUID: {pickup_uuid}")
+        app.logger.info("Pickup person added with UUID: {}".format(pickup_uuid))
         return jsonify({
-            'message': 'Pickup person assigned successfully',
+            'message': 'Pickup person created successfully',
+            'pickup_person_uuid': pickup_uuid,
             'pickup_url': pickup_url
         }), 200
 
     except Exception as e:
         app.logger.exception("Error assigning pickup:")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/create-journey', methods=['POST'])
+@jwt_required()
+def create_journey():
+    try:
+        data = request.get_json()
+        
+        # Get current user (parent)
+        current_user_email = get_jwt_identity()
+        parent = Parent.query.filter_by(user_email=current_user_email).first()
+        if not parent:
+            return jsonify({'error': 'Parent not found'}), 404
+        
+        # Extract journey data
+        pickup_person_id = data.get('pickup_person_id')
+        child_id = data.get('child_id')
+        dropoff_location = data.get('dropoff_location', '')
+        dropoff_latitude = data.get('dropoff_latitude')
+        dropoff_longitude = data.get('dropoff_longitude')
+        
+        # Validate required fields
+        if not pickup_person_id or not child_id:
+            return jsonify({'error': 'Pickup person ID and child ID are required'}), 400
+        
+        # Verify the child belongs to this parent
+        child = Kid.query.get(child_id)
+        if not child or child.parent_id != parent.id:
+            return jsonify({'error': 'Child not found or unauthorized'}), 404
+        
+        # Verify the pickup person exists
+        pickup_person = PickupPerson.query.filter_by(uuid=pickup_person_id).first()
+        if not pickup_person:
+            return jsonify({'error': 'Pickup person not found'}), 404
+        
+        # Generate unique pickup ID for this journey
+        pickup_id = str(uuid.uuid4())[:8].upper()
+        
+        # Create the journey
+        journey = PickupJourney(
+            pickup_id=pickup_id,
+            parent_id=str(parent.id),
+            child_id=str(child_id),
+            pickup_person_id=pickup_person_id,
+            status='pending',
+            dropoff_location=dropoff_location,
+            dropoff_latitude=float(dropoff_latitude) if dropoff_latitude else None,
+            dropoff_longitude=float(dropoff_longitude) if dropoff_longitude else None
+        )
+        
+        db.session.add(journey)
+        db.session.commit()
+        
+        app.logger.info("Journey created with pickup_id: {}".format(pickup_id))
+        return jsonify({
+            'message': 'Journey created successfully',
+            'pickup_id': pickup_id,
+            'journey_id': journey.id
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        app.logger.exception("Error creating journey:")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/register-token', methods=['POST'])
@@ -414,8 +615,8 @@ def scan_pickup():
     parent = Parent.query.get(kid.parent_id)
 
     if parent and parent.push_token:
-        send_notification(parent.push_token, f"{person.name} has {data['status']} for {kid.name}.")
-        return jsonify({'message': f'{data["status"].capitalize()} notification sent.'})
+        send_notification(parent.push_token, "{} has {} for {}.".format(person.name, data['status'], kid.name))
+        return jsonify({'message': '{} notification sent.'.format(data["status"].capitalize())})
     return jsonify({'message': 'Parent or token not found'}), 404
 
 @app.route('/get_status', methods=['GET'])
@@ -456,7 +657,10 @@ def get_all_journeys():
                     'timestamp': latest_journey.timestamp.isoformat() if latest_journey.timestamp else None,
                     'parent_id': latest_journey.parent_id,
                     'child_id': latest_journey.child_id,
-                    'pickup_person_id': latest_journey.pickup_person_id
+                    'pickup_person_id': latest_journey.pickup_person_id,
+                    'dropoff_location': latest_journey.dropoff_location,
+                    'dropoff_latitude': latest_journey.dropoff_latitude,
+                    'dropoff_longitude': latest_journey.dropoff_longitude
                 })
         
         return jsonify({'journeys': journeys}), 200
@@ -467,13 +671,13 @@ def get_all_journeys():
 def get_user_journeys():
     try:
         # For now, return all journeys since we're not using authentication
-        print("Getting all journeys (no authentication required)")
+        app.logger.info("Getting all journeys (no authentication required)")
         
         # Get all journeys
         journeys = []
         all_journeys = PickupJourney.query.order_by(PickupJourney.timestamp.desc()).all()
         
-        print(f"Found {len(all_journeys)} total journeys")
+        app.logger.info("Found {} total journeys".format(len(all_journeys)))
         
         # Group by pickup_id and get latest status for each
         pickup_groups = {}
@@ -490,13 +694,16 @@ def get_user_journeys():
                 'timestamp': latest_journey.timestamp.isoformat() if latest_journey.timestamp else None,
                 'parent_id': latest_journey.parent_id,
                 'child_id': latest_journey.child_id,
-                'pickup_person_id': latest_journey.pickup_person_id
+                'pickup_person_id': latest_journey.pickup_person_id,
+                'dropoff_location': latest_journey.dropoff_location,
+                'dropoff_latitude': latest_journey.dropoff_latitude,
+                'dropoff_longitude': latest_journey.dropoff_longitude
             })
         
         return jsonify({'journeys': journeys}), 200
     except Exception as e:
-        print(f"Error in get_user_journeys: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        app.logger.error("Error in get_user_journeys: {}".format(str(e)))
+        return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/add_dummy_payments', methods=['POST'])
 def add_dummy_payments():
@@ -848,24 +1055,91 @@ def get_child_summary(child_id):
                 cursor.execute(attendance_sql, (str(child_id), child.name))
                 recent_attendance = cursor.fetchall()
             except Exception as e:
-                print(f"Error fetching attendance: {e}")
+                app.logger.error("Error fetching attendance: {}".format(e))
                 recent_attendance = []
             
-            # Get recent grades (last 6 months)
+            # Get average grade summary
             grades_sql = """
-                SELECT id, subject, grade, remarks, date_recorded
+                SELECT 
+                    'Average' as subject,
+                    CONCAT(ROUND(AVG(
+                        CASE 
+                            WHEN grade = 'A+' THEN 4.0
+                            WHEN grade = 'A' THEN 4.0
+                            WHEN grade = 'A-' THEN 3.7
+                            WHEN grade = 'B+' THEN 3.3
+                            WHEN grade = 'B' THEN 3.0
+                            WHEN grade = 'B-' THEN 2.7
+                            WHEN grade = 'C+' THEN 2.3
+                            WHEN grade = 'C' THEN 2.0
+                            WHEN grade = 'C-' THEN 1.7
+                            WHEN grade = 'D+' THEN 1.3
+                            WHEN grade = 'D' THEN 1.0
+                            WHEN grade = 'D-' THEN 0.7
+                            WHEN grade = 'F' THEN 0.0
+                            ELSE NULL
+                        END
+                    ), 1), '/4.0') as grade,
+                    CAST(CONCAT(COUNT(*), ' subjects') AS CHAR) as remarks,
+                    MAX(date_recorded) as date_recorded
                 FROM grades 
                 WHERE kid_id = %s
-                AND date_recorded >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
-                ORDER BY date_recorded DESC
+                AND grade IN ('A+', 'A', 'A-', 'B+', 'B', 'B-', 'C+', 'C', 'C-', 'D+', 'D', 'D-', 'F')
+            """
+            
+            # Get highest grade
+            highest_grade_sql = """
+                SELECT 
+                    subject,
+                    grade,
+                    remarks,
+                    date_recorded
+                FROM grades 
+                WHERE kid_id = %s
+                ORDER BY 
+                    CASE 
+                        WHEN grade = 'A+' THEN 1
+                        WHEN grade = 'A' THEN 2
+                        WHEN grade = 'A-' THEN 3
+                        WHEN grade = 'B+' THEN 4
+                        WHEN grade = 'B' THEN 5
+                        WHEN grade = 'B-' THEN 6
+                        WHEN grade = 'C+' THEN 7
+                        WHEN grade = 'C' THEN 8
+                        WHEN grade = 'C-' THEN 9
+                        WHEN grade = 'D+' THEN 10
+                        WHEN grade = 'D' THEN 11
+                        WHEN grade = 'D-' THEN 12
+                        WHEN grade = 'F' THEN 13
+                        ELSE 14
+                    END ASC,
+                    date_recorded DESC
                 LIMIT 1
             """
             try:
                 cursor.execute(grades_sql, (child_id,))
-                recent_grades = cursor.fetchall()
+                average_grade = cursor.fetchone()
+                app.logger.info("Average grade fetched successfully: {}".format(average_grade))
             except Exception as e:
-                print(f"Error fetching grades: {e}")
-                recent_grades = []
+                app.logger.error("Error fetching average grade: {}".format(e))
+                app.logger.error("SQL query: {}".format(grades_sql))
+                app.logger.error("Child ID: {}".format(child_id))
+                average_grade = None
+                
+            try:
+                cursor.execute(highest_grade_sql, (child_id,))
+                highest_grade = cursor.fetchone()
+                app.logger.info("Highest grade fetched successfully: {}".format(highest_grade))
+            except Exception as e:
+                app.logger.error("Error fetching highest grade: {}".format(e))
+                app.logger.error("SQL query: {}".format(highest_grade_sql))
+                app.logger.error("Child ID: {}".format(child_id))
+                highest_grade = None
+                
+            # Only return the highest grade
+            recent_grades = []
+            if highest_grade:
+                recent_grades.append(highest_grade)
             
             # Calculate attendance statistics
             attendance_stats_sql = """
@@ -882,26 +1156,42 @@ def get_child_summary(child_id):
                 cursor.execute(attendance_stats_sql, (str(child_id), child.name))
                 attendance_stats = cursor.fetchone()
             except Exception as e:
-                print(f"Error calculating attendance stats: {e}")
+                app.logger.error("Error calculating attendance stats: {}".format(e))
                 attendance_stats = {'total_days': 0, 'present_days': 0, 'absent_days': 0, 'late_days': 0}
             
             # Calculate grade statistics
             grades_stats_sql = """
                 SELECT 
                     COUNT(*) as total_grades,
-                    AVG(CAST(grade AS DECIMAL(5,2))) as average_grade,
+                    AVG(
+                        CASE 
+                            WHEN grade = 'A+' THEN 4.0
+                            WHEN grade = 'A' THEN 4.0
+                            WHEN grade = 'A-' THEN 3.7
+                            WHEN grade = 'B+' THEN 3.3
+                            WHEN grade = 'B' THEN 3.0
+                            WHEN grade = 'B-' THEN 2.7
+                            WHEN grade = 'C+' THEN 2.3
+                            WHEN grade = 'C' THEN 2.0
+                            WHEN grade = 'C-' THEN 1.7
+                            WHEN grade = 'D+' THEN 1.3
+                            WHEN grade = 'D' THEN 1.0
+                            WHEN grade = 'D-' THEN 0.7
+                            WHEN grade = 'F' THEN 0.0
+                            ELSE NULL
+                        END
+                    ) as average_grade,
                     MIN(grade) as lowest_grade,
                     MAX(grade) as highest_grade
                 FROM grades 
                 WHERE kid_id = %s
-                AND date_recorded >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
-                AND grade REGEXP '^[0-9]+$'
+                AND grade IN ('A+', 'A', 'A-', 'B+', 'B', 'B-', 'C+', 'C', 'C-', 'D+', 'D', 'D-', 'F')
             """
             try:
                 cursor.execute(grades_stats_sql, (child_id,))
                 grades_stats = cursor.fetchone()
             except Exception as e:
-                print(f"Error calculating grades stats: {e}")
+                app.logger.error("Error calculating grades stats: {}".format(e))
                 grades_stats = {'total_grades': 0, 'average_grade': 0, 'lowest_grade': 0, 'highest_grade': 0}
         
         connection.close()
@@ -1172,7 +1462,10 @@ def get_pickup_persons():
                 'kid_id': pickup_person.kid_id,
                 'image_url': pickup_person.image,
                 'pickup_id': pickup_person.pickup_id,
-                'uuid': pickup_person.uuid
+                'uuid': pickup_person.uuid,
+                'is_active': pickup_person.is_active,
+                'created_at': pickup_person.created_at.isoformat() if pickup_person.created_at else None,
+                'updated_at': pickup_person.updated_at.isoformat() if pickup_person.updated_at else None
             })
         
         return jsonify({
@@ -1182,6 +1475,53 @@ def get_pickup_persons():
         
     except Exception as e:
         app.logger.exception("Error fetching pickup persons:")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/toggle-pickup-person-status/<int:pickup_person_id>', methods=['PUT'])
+@jwt_required()
+def toggle_pickup_person_status(pickup_person_id):
+    try:
+        current_user_email = get_jwt_identity()
+        
+        # Get the parent record for this user
+        parent = Parent.query.filter_by(user_email=current_user_email).first()
+        if not parent:
+            return jsonify({'error': 'Parent not found'}), 404
+        
+        # Get the pickup person
+        pickup_person = PickupPerson.query.get(pickup_person_id)
+        if not pickup_person:
+            return jsonify({'error': 'Pickup person not found'}), 404
+        
+        # Verify the pickup person belongs to a kid of this parent
+        kid = Kid.query.get(pickup_person.kid_id)
+        if not kid or kid.parent_id != parent.id:
+            return jsonify({'error': 'Unauthorized access to this pickup person'}), 403
+        
+        # Toggle the active status
+        pickup_person.is_active = not pickup_person.is_active
+        db.session.commit()
+        
+        app.logger.info("Pickup person {} status toggled to {} by user {}".format(
+            pickup_person.name, 
+            "active" if pickup_person.is_active else "inactive",
+            current_user_email
+        ))
+        
+        return jsonify({
+            'success': True,
+            'message': 'Pickup person status updated successfully',
+            'pickup_person': {
+                'id': pickup_person.id,
+                'name': pickup_person.name,
+                'is_active': pickup_person.is_active,
+                'updated_at': pickup_person.updated_at.isoformat() if pickup_person.updated_at else None
+            }
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        app.logger.exception("Error toggling pickup person status:")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/get-journey-details/<string:pickup_id>', methods=['GET'])
@@ -1228,7 +1568,10 @@ def get_journey_details(pickup_id):
                 'uuid': pickup_person.uuid
             },
             'status': journey.status if journey else 'pending',
-            'timestamp': journey.timestamp.isoformat() if journey and journey.timestamp else None
+            'timestamp': journey.timestamp.isoformat() if journey and journey.timestamp else None,
+            'dropoff_location': journey.dropoff_location if journey else None,
+            'dropoff_latitude': journey.dropoff_latitude if journey else None,
+            'dropoff_longitude': journey.dropoff_longitude if journey else None
         }
         
         return jsonify({
@@ -1238,6 +1581,146 @@ def get_journey_details(pickup_id):
         
     except Exception as e:
         app.logger.exception("Error fetching journey details:")
+        return jsonify({'error': str(e)}), 500
+
+# Parent Payment Routes
+@app.route('/api/parent/pending-payments', methods=['GET'])
+@jwt_required()
+def get_parent_pending_payments():
+    try:
+        current_user_email = get_jwt_identity()
+        
+        # Get the parent record for this user
+        parent = Parent.query.filter_by(user_email=current_user_email).first()
+        if not parent:
+            return jsonify({'error': 'Parent not found'}), 404
+        
+        # Get pending payments directly by parent_id
+        pending_payments = Payment.query.filter(
+            Payment.parent_id == str(parent.id),
+            Payment.status == 'pending'
+        ).order_by(Payment.created_at.desc()).all()
+        
+        payment_list = []
+        for payment in pending_payments:
+            # Get child information
+            child = Kid.query.get(payment.child_id)
+            payment_list.append({
+                'id': payment.id,
+                'payment_id': payment.payment_id,
+                'child_name': child.name if child else 'Unknown',
+                'child_id': payment.child_id,
+                'amount': payment.amount,
+                'currency': payment.currency,
+                'status': payment.status,
+                'description': payment.description,
+                'journey_date': payment.journey_date.isoformat() if payment.journey_date else None,
+                'created_at': payment.created_at.isoformat() if payment.created_at else None,
+                'payment_link': "https://outrankconsult.com/payment/KidMate/pay.php?link={}".format(payment.payment_id)
+            })
+        
+        return jsonify({
+            'success': True,
+            'pending_payments': payment_list
+        })
+        
+    except Exception as e:
+        app.logger.exception("Error fetching parent pending payments:")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/parent/all-payments', methods=['GET'])
+@jwt_required()
+def get_parent_all_payments():
+    """Get all payments (pending, completed, failed) for the authenticated parent"""
+    try:
+        current_user_email = get_jwt_identity()
+        
+        # Get the parent record for this user
+        parent = Parent.query.filter_by(user_email=current_user_email).first()
+        if not parent:
+            return jsonify({'error': 'Parent not found'}), 404
+        
+        # Get all payments for this parent (all statuses)
+        all_payments = Payment.query.filter(
+            Payment.parent_id == str(parent.id)
+        ).order_by(Payment.created_at.desc()).all()
+        
+        payment_list = []
+        for payment in all_payments:
+            # Get child information
+            child = Kid.query.get(payment.child_id)
+            payment_list.append({
+                'id': payment.id,
+                'payment_id': payment.payment_id,
+                'child_name': child.name if child else f"Child ID: {payment.child_id}",
+                'child_id': payment.child_id,
+                'amount': payment.amount,
+                'currency': payment.currency,
+                'status': payment.status,
+                'description': payment.description,
+                'journey_date': payment.journey_date.isoformat() if payment.journey_date else None,
+                'created_at': payment.created_at.isoformat() if payment.created_at else None,
+                'updated_at': payment.updated_at.isoformat() if payment.updated_at else None,
+                'payment_method': payment.payment_method,
+                'payment_link': "https://outrankconsult.com/payment/KidMate/pay.php?link={}".format(payment.payment_id)
+            })
+        
+        return jsonify({
+            'success': True,
+            'payments': payment_list,
+            'total_count': len(payment_list)
+        })
+        
+    except Exception as e:
+        app.logger.exception("Error fetching parent all payments:")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/parent/payment-details/<string:payment_id>', methods=['GET'])
+@jwt_required()
+def get_payment_details(payment_id):
+    try:
+        current_user_email = get_jwt_identity()
+        
+        # Get the parent record for this user
+        parent = Parent.query.filter_by(user_email=current_user_email).first()
+        if not parent:
+            return jsonify({'error': 'Parent not found'}), 404
+        
+        # Get the payment
+        payment = Payment.query.filter_by(payment_id=payment_id).first()
+        if not payment:
+            return jsonify({'error': 'Payment not found'}), 404
+        
+        # Verify the payment belongs to this parent
+        if payment.parent_id != str(parent.id):
+            return jsonify({'error': 'Unauthorized access to this payment'}), 403
+        
+        # Get child information
+        child = Kid.query.get(payment.child_id)
+        if not child:
+            return jsonify({'error': 'Child not found'}), 404
+        
+        payment_details = {
+            'id': payment.id,
+            'payment_id': payment.payment_id,
+            'child_name': child.name,
+            'child_id': payment.child_id,
+            'amount': payment.amount,
+            'currency': payment.currency,
+            'status': payment.status,
+            'description': payment.description,
+            'journey_date': payment.journey_date.isoformat() if payment.journey_date else None,
+            'created_at': payment.created_at.isoformat() if payment.created_at else None,
+            'payment_link': "https://outrankconsult.com/payment/KidMate/pay.php?link={}".format(payment.payment_id)
+        }
+        
+        return jsonify({
+            'success': True,
+            'payment_details': payment_details
+        })
+        
+    except Exception as e:
+        app.logger.exception("Error fetching payment details:")
         return jsonify({'error': str(e)}), 500
 
 # Run server
