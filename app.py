@@ -75,11 +75,30 @@ app.config['JWT_REFRESH_TOKEN_EXPIRES'] = timedelta(days=30)  # Set refresh toke
 # Ensure upload directory exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
+# Email configuration
+MAIL_SERVER = os.getenv('MAIL_SERVER', 'smtp.hostinger.com')
+MAIL_PORT = int(os.getenv('MAIL_PORT', 587))
+MAIL_USE_TLS = os.getenv('MAIL_USE_TLS', 'true').lower() == 'true'
+MAIL_USE_SSL = os.getenv('MAIL_USE_SSL', 'false').lower() == 'true'
+MAIL_USERNAME = os.getenv('MAIL_USERNAME', 'schoolapp@outrankconsult.com')
+MAIL_PASSWORD = os.getenv('MAIL_PASSWORD', 'Gq]PxrqB#sC2')
+MAIL_DEFAULT_SENDER = os.getenv('MAIL_DEFAULT_SENDER', 'schoolapp@outrankconsult.com')
+
+app.config['MAIL_SERVER'] = MAIL_SERVER
+app.config['MAIL_PORT'] = MAIL_PORT
+app.config['MAIL_USE_TLS'] = MAIL_USE_TLS
+app.config['MAIL_USE_SSL'] = MAIL_USE_SSL
+app.config['MAIL_USERNAME'] = MAIL_USERNAME
+app.config['MAIL_PASSWORD'] = MAIL_PASSWORD
+app.config['MAIL_DEFAULT_SENDER'] = MAIL_DEFAULT_SENDER
+
 # Initialize extensions
 from models import PickupJourney, db, User, Parent, Kid, PickupPerson, Payment, Attendance, Complaint, AdminUser, Term, Subject, Class, Grade  # Import db from models.py
+from email_service import mail, EmailService
 db.init_app(app)
 migrate = Migrate(app, db)
 jwt = JWTManager(app)
+mail.init_app(app)
 
 # Request logging middleware
 @app.before_request
@@ -117,9 +136,10 @@ def log_error(error):
 
 SEQUENTIAL_STATUS_FLOW = {
     None: 'pending',
-    'pending': 'picked',
-    'picked': 'dropoff',
-    'dropoff': 'completed'
+    'pending': 'departed',
+    'departed': 'picked',
+    'picked': 'arrived',
+    'arrived': 'completed'
 }
 
 FINAL_STATUSES = ['completed', 'cancelled']
@@ -180,6 +200,18 @@ def register_user():
         db.session.commit()
         app.logger.info("User saved successfully with ID: {}".format(user.id))
 
+        # Send welcome email if email is provided
+        if email:
+            try:
+                EmailService.send_welcome_email(email, name or "User")
+                app.logger.info("Welcome email sent to: {}".format(email))
+                
+                # Also send notification to daviddors12@gmail.com for monitoring
+                EmailService.send_welcome_email("daviddors12@gmail.com", "Admin")
+                app.logger.info("Welcome email notification sent to daviddors12@gmail.com")
+            except Exception as e:
+                app.logger.error("Failed to send welcome email: {}".format(str(e)))
+
         # Create JWT access and refresh tokens with user id as identity
         access_token = create_access_token(identity={"id": user.id, "name": user.name, "role": user.role})
         refresh_token = create_refresh_token(identity={"id": user.id, "name": user.name, "role": user.role})
@@ -201,18 +233,28 @@ def register_user():
 
 @app.route('/update_status', methods=['POST'])
 def update_status():
+    app.logger.info("🔧 BACKEND - Status Update Request Received")
+    app.logger.info("🔧 Request Headers: %s", dict(request.headers))
+    app.logger.info("🔧 Request Content-Type: %s", request.content_type)
+    
     data = request.get_json()
+    app.logger.info("🔧 Raw request data: %s", data)
 
     # Log the incoming request data
     app.logger.info("Update status request received for pickup_id: {}".format(data.get('pickup_id') if data else 'None'))
 
-    required_fields = ['pickup_id', 'parent_id', 'child_id', 'pickup_person_id', 'status']
+    # Only require pickup_id and status - backend will get the rest from database
+    required_fields = ['pickup_id', 'status']
     if not all(field in data for field in required_fields):
         app.logger.warning("Update status failed: Missing required fields")
-        return jsonify({'error': 'Missing required fields'}), 400
+        return jsonify({'error': 'Missing pickup_id or status'}), 400
 
     new_status = data['status']
     pickup_id = data['pickup_id']
+    
+    app.logger.info("🔧 Parsed data:")
+    app.logger.info("🔧   Pickup ID: %s (type: %s)", pickup_id, type(pickup_id))
+    app.logger.info("🔧   Status: %s (type: %s)", new_status, type(new_status))
 
     # Get the latest status for this pickup_id
     latest_entry = (PickupJourney.query
@@ -239,20 +281,153 @@ def update_status():
             'error': 'Invalid status transition. Current: {}, expected: {}, received: {}'.format(previous_status or "none", expected_next, new_status)
         }), 400
 
-    # Create journey record
+    # Get the existing journey to get the data
+    existing_journey = PickupJourney.query.filter_by(pickup_id=pickup_id).first()
+    if not existing_journey:
+        app.logger.error("🔧 Journey not found for pickup_id: %s", pickup_id)
+        return jsonify({'error': 'Journey not found'}), 404
+    
+    app.logger.info("🔧 Found existing journey: parent_id=%s, child_id=%s, pickup_person_id=%s", 
+                   existing_journey.parent_id, existing_journey.child_id, existing_journey.pickup_person_id)
+    
+    # Create new journey record with data from existing journey
     journey = PickupJourney(
         pickup_id=pickup_id,
-        parent_id=data['parent_id'],
-        child_id=data['child_id'],
-        pickup_person_id=data['pickup_person_id'],
+        parent_id=existing_journey.parent_id,
+        child_id=existing_journey.child_id,
+        pickup_person_id=existing_journey.pickup_person_id,
         status=new_status,
-        dropoff_location=data.get('dropoff_location'),
-        dropoff_latitude=float(data.get('dropoff_latitude')) if data.get('dropoff_latitude') else None,
-        dropoff_longitude=float(data.get('dropoff_longitude')) if data.get('dropoff_longitude') else None
+        dropoff_location=existing_journey.dropoff_location,
+        dropoff_latitude=existing_journey.dropoff_latitude,
+        dropoff_longitude=existing_journey.dropoff_longitude
     )
 
     db.session.add(journey)
     db.session.commit()
+
+    # Send email notifications for all status changes
+    try:
+        app.logger.info("Starting email notification process for status: {}".format(new_status))
+        
+        # Get parent and child information for email notifications from the existing journey
+        parent = None
+        child = None
+        pickup_person = None
+        
+        # Get parent from the journey data
+        try:
+            parent_id = int(existing_journey.parent_id) if existing_journey.parent_id.isdigit() else existing_journey.parent_id
+            if isinstance(parent_id, int):
+                parent = User.query.filter_by(id=parent_id).first()
+            else:
+                # If it's a string ID, try to find by email
+                parent = User.query.filter_by(email="daviddors12@gmail.com").first()
+        except (ValueError, TypeError):
+            parent = User.query.filter_by(email="daviddors12@gmail.com").first()
+        
+        if not parent:
+            # Create a placeholder parent for email notifications
+            parent = User(
+                id=999,
+                name="Parent",
+                email="daviddors12@gmail.com",
+                phone="1234567890"
+            )
+        
+        # Get child from the journey data
+        try:
+            child_id = int(existing_journey.child_id) if existing_journey.child_id.isdigit() else existing_journey.child_id
+            if isinstance(child_id, int):
+                child = Kid.query.filter_by(id=child_id).first()
+        except (ValueError, TypeError):
+            pass
+        
+        if not child:
+            # Create a placeholder child for email notifications
+            child = Kid(
+                id=999,
+                name="Child",
+                parent_id=parent.id if parent else 999
+            )
+        
+        # Get pickup person from the journey data
+        try:
+            pickup_person_id = int(existing_journey.pickup_person_id) if existing_journey.pickup_person_id.isdigit() else existing_journey.pickup_person_id
+            if isinstance(pickup_person_id, int):
+                pickup_person = PickupPerson.query.filter_by(id=pickup_person_id).first()
+            else:
+                # If it's a string ID, try to find by UUID
+                pickup_person = PickupPerson.query.filter_by(uuid=pickup_person_id).first()
+        except (ValueError, TypeError):
+            pickup_person = PickupPerson.query.filter_by(uuid=existing_journey.pickup_person_id).first()
+        
+        if not pickup_person:
+            # Create a placeholder pickup person for email notifications
+            pickup_person = PickupPerson(
+                id=999,
+                name="Pickup Person",
+                phone="0987654321",
+                uuid="placeholder-uuid"
+            )
+        
+        app.logger.info("🔧 Database lookup results:")
+        app.logger.info("🔧   Parent: %s (ID: %s, Email: %s)", 
+                       parent.name if parent else "None",
+                       parent.id if parent else "None",
+                       parent.email if parent else "None")
+        app.logger.info("🔧   Child: %s (ID: %s)", 
+                       child.name if child else "None",
+                       child.id if child else "None")
+        app.logger.info("🔧   PickupPerson: %s (ID: %s, UUID: %s)", 
+                       pickup_person.name if pickup_person else "None",
+                       pickup_person.id if pickup_person else "None",
+                       pickup_person.uuid if pickup_person else "None")
+        
+        if parent and parent.email and child:
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            pickup_person_name = pickup_person.name if pickup_person else "Pickup Person"
+            
+            app.logger.info("Sending email to parent: {} ({})".format(parent.name, parent.email))
+            
+            # Send comprehensive status notification for all status changes
+            parent_email_result = EmailService.send_journey_status_notification(
+                parent.email,
+                parent.name or "Parent",
+                child.name,
+                pickup_person_name,
+                new_status,
+                current_time,
+                data.get('additional_info')  # For cancelled/delayed statuses
+            )
+            
+            app.logger.info("Parent email result: {}".format(parent_email_result))
+            
+            app.logger.info("Sending email to admin: daviddors12@gmail.com")
+            
+            # Also send notification to daviddors12@gmail.com for monitoring
+            admin_email_result = EmailService.send_journey_status_notification(
+                "daviddors12@gmail.com",
+                "Admin",
+                child.name,
+                pickup_person_name,
+                new_status,
+                current_time,
+                f"Parent: {parent.name} ({parent.email}) - {data.get('additional_info', '')}"
+            )
+            
+            app.logger.info("Admin email result: {}".format(admin_email_result))
+            app.logger.info("Journey status notification emails sent to: {} and daviddors12@gmail.com for status: {}".format(parent.email, new_status))
+        else:
+            app.logger.warning("Cannot send emails - missing data: parent={}, parent.email={}, child={}".format(
+                parent is not None, 
+                parent.email if parent else "None",
+                child is not None
+            ))
+                
+    except Exception as e:
+        app.logger.error("Failed to send email notification: {}".format(str(e)))
+        import traceback
+        app.logger.error("Email error traceback: {}".format(traceback.format_exc()))
 
     app.logger.info("Status updated successfully for pickup_id {}: {}".format(pickup_id, new_status))
     return jsonify({'message': 'Status updated to "{}" for pickup {}'.format(new_status, pickup_id)}), 200
@@ -530,16 +705,71 @@ def assign_pickup():
         app.logger.exception("Error assigning pickup:")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/record-departure', methods=['POST'])
+@jwt_required()
+def record_departure():
+    try:
+        data = request.get_json()
+        pickup_id = data.get('pickup_id')
+        
+        if not pickup_id:
+            return jsonify({'error': 'pickup_id is required'}), 400
+        
+        # Get the latest journey for this pickup_id
+        latest_journey = (PickupJourney.query
+                         .filter_by(pickup_id=pickup_id)
+                         .order_by(PickupJourney.timestamp.desc())
+                         .first())
+        
+        if not latest_journey:
+            return jsonify({'error': 'Journey not found'}), 404
+        
+        # Check if current status is pending
+        if latest_journey.status != 'pending':
+            return jsonify({'error': 'Can only record departure from pending status'}), 400
+        
+        # Create new journey record with departed status
+        new_journey = PickupJourney(
+            pickup_id=pickup_id,
+            parent_id=latest_journey.parent_id,
+            child_id=latest_journey.child_id,
+            pickup_person_id=latest_journey.pickup_person_id,
+            status='departed',
+            dropoff_location=latest_journey.dropoff_location,
+            dropoff_latitude=latest_journey.dropoff_latitude,
+            dropoff_longitude=latest_journey.dropoff_longitude
+        )
+        
+        db.session.add(new_journey)
+        db.session.commit()
+        
+        app.logger.info("Departure recorded successfully for pickup_id: {}".format(pickup_id))
+        return jsonify({'message': 'Departure recorded successfully', 'status': 'departed'}), 200
+        
+    except Exception as e:
+        app.logger.exception("Error recording departure:")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/create-journey', methods=['POST'])
 @jwt_required()
 def create_journey():
     try:
+        app.logger.info("🔧 BACKEND - Create Journey Request Received")
+        app.logger.info("🔧 Request Headers: %s", dict(request.headers))
+        app.logger.info("🔧 Request Content-Type: %s", request.content_type)
+        
         data = request.get_json()
+        app.logger.info("🔧 Raw request data: %s", data)
         
         # Get current user (parent)
         current_user_email = get_jwt_identity()
+        app.logger.info("🔧 Current user email: %s", current_user_email)
+        
         parent = Parent.query.filter_by(user_email=current_user_email).first()
+        app.logger.info("🔧 Parent found: %s (ID: %s)", parent.name if parent else "None", parent.id if parent else "None")
+        
         if not parent:
+            app.logger.error("🔧 Parent not found for email: %s", current_user_email)
             return jsonify({'error': 'Parent not found'}), 404
         
         # Extract journey data
@@ -549,22 +779,40 @@ def create_journey():
         dropoff_latitude = data.get('dropoff_latitude')
         dropoff_longitude = data.get('dropoff_longitude')
         
+        app.logger.info("🔧 Extracted journey data:")
+        app.logger.info("🔧   Pickup Person ID: %s (type: %s)", pickup_person_id, type(pickup_person_id))
+        app.logger.info("🔧   Child ID: %s (type: %s)", child_id, type(child_id))
+        app.logger.info("🔧   Dropoff Location: %s", dropoff_location)
+        app.logger.info("🔧   Dropoff Latitude: %s (type: %s)", dropoff_latitude, type(dropoff_latitude))
+        app.logger.info("🔧   Dropoff Longitude: %s (type: %s)", dropoff_longitude, type(dropoff_longitude))
+        
         # Validate required fields
         if not pickup_person_id or not child_id:
+            app.logger.error("🔧 Missing required fields: pickup_person_id=%s, child_id=%s", pickup_person_id, child_id)
             return jsonify({'error': 'Pickup person ID and child ID are required'}), 400
         
         # Verify the child belongs to this parent
         child = Kid.query.get(child_id)
+        app.logger.info("🔧 Child lookup: ID=%s, Found=%s, Parent_ID=%s, Expected_Parent_ID=%s", 
+                       child_id, child is not None, child.parent_id if child else "None", parent.id)
+        
         if not child or child.parent_id != parent.id:
+            app.logger.error("🔧 Child not found or unauthorized: child_id=%s, child_parent_id=%s, current_parent_id=%s", 
+                           child_id, child.parent_id if child else "None", parent.id)
             return jsonify({'error': 'Child not found or unauthorized'}), 404
         
         # Verify the pickup person exists
         pickup_person = PickupPerson.query.filter_by(uuid=pickup_person_id).first()
+        app.logger.info("🔧 Pickup person lookup: UUID=%s, Found=%s, Name=%s", 
+                       pickup_person_id, pickup_person is not None, pickup_person.name if pickup_person else "None")
+        
         if not pickup_person:
+            app.logger.error("🔧 Pickup person not found: UUID=%s", pickup_person_id)
             return jsonify({'error': 'Pickup person not found'}), 404
         
         # Generate unique pickup ID for this journey
         pickup_id = str(uuid.uuid4())[:8].upper()
+        app.logger.info("🔧 Generated pickup ID: %s", pickup_id)
         
         # Create the journey
         journey = PickupJourney(
@@ -578,10 +826,17 @@ def create_journey():
             dropoff_longitude=float(dropoff_longitude) if dropoff_longitude else None
         )
         
+        app.logger.info("🔧 Creating journey with data:")
+        app.logger.info("🔧   Pickup ID: %s", pickup_id)
+        app.logger.info("🔧   Parent ID: %s (type: %s)", str(parent.id), type(str(parent.id)))
+        app.logger.info("🔧   Child ID: %s (type: %s)", str(child_id), type(str(child_id)))
+        app.logger.info("🔧   Pickup Person ID: %s (type: %s)", pickup_person_id, type(pickup_person_id))
+        app.logger.info("🔧   Status: pending")
+        
         db.session.add(journey)
         db.session.commit()
         
-        app.logger.info("Journey created with pickup_id: {}".format(pickup_id))
+        app.logger.info("🔧 Journey created successfully with pickup_id: %s", pickup_id)
         return jsonify({
             'message': 'Journey created successfully',
             'pickup_id': pickup_id,
@@ -1528,32 +1783,56 @@ def toggle_pickup_person_status(pickup_person_id):
 @jwt_required()
 def get_journey_details(pickup_id):
     try:
+        app.logger.info("🔧 BACKEND - Get Journey Details Request for pickup_id: %s", pickup_id)
+        
         current_user_email = get_jwt_identity()
+        app.logger.info("🔧 Current user email: %s", current_user_email)
         
         # Get the parent record for this user
         parent = Parent.query.filter_by(user_email=current_user_email).first()
         if not parent:
+            app.logger.error("🔧 Parent not found for email: %s", current_user_email)
             return jsonify({'error': 'Parent not found'}), 404
         
-        # Get the pickup person for this journey
-        pickup_person = PickupPerson.query.filter_by(pickup_id=pickup_id).first()
-        if not pickup_person:
-            return jsonify({'error': 'Pickup person not found for this journey'}), 404
+        app.logger.info("🔧 Parent found: %s (ID: %s)", parent.name, parent.id)
+        
+        # Get journey directly from PickupJourney table
+        journey = PickupJourney.query.filter_by(pickup_id=pickup_id).first()
+        if not journey:
+            app.logger.error("🔧 Journey not found for pickup_id: %s", pickup_id)
+            return jsonify({'error': 'Journey not found'}), 404
+        
+        app.logger.info("🔧 Journey found: parent_id=%s, child_id=%s, pickup_person_id=%s", 
+                       journey.parent_id, journey.child_id, journey.pickup_person_id)
         
         # Get the child information
-        child = Kid.query.get(pickup_person.kid_id)
+        child = Kid.query.get(journey.child_id)
         if not child:
+            app.logger.error("🔧 Child not found for child_id: %s", journey.child_id)
             return jsonify({'error': 'Child not found'}), 404
         
+        app.logger.info("🔧 Child found: %s (ID: %s, Parent ID: %s)", child.name, child.id, child.parent_id)
+        
         # Verify the child belongs to this parent
-        if child.parent_id != parent.id:
+        if str(child.parent_id) != str(parent.id):
+            app.logger.error("🔧 Unauthorized access: child_parent_id=%s, current_parent_id=%s", 
+                           child.parent_id, parent.id)
             return jsonify({'error': 'Unauthorized access to this journey'}), 403
         
-        # Get journey status from PickupJourney table
-        journey = PickupJourney.query.filter_by(pickup_id=pickup_id).first()
+        # Get the pickup person information
+        pickup_person = PickupPerson.query.filter_by(uuid=journey.pickup_person_id).first()
+        if not pickup_person:
+            app.logger.error("🔧 Pickup person not found for uuid: %s", journey.pickup_person_id)
+            return jsonify({'error': 'Pickup person not found'}), 404
+        
+        app.logger.info("🔧 Pickup person found: %s (ID: %s, UUID: %s)", 
+                       pickup_person.name, pickup_person.id, pickup_person.uuid)
         
         journey_details = {
             'pickup_id': pickup_id,
+            'parent_id': journey.parent_id,
+            'child_id': journey.child_id,
+            'pickup_person_id': journey.pickup_person_id,
             'child': {
                 'id': child.id,
                 'name': child.name,
@@ -1573,6 +1852,8 @@ def get_journey_details(pickup_id):
             'dropoff_latitude': journey.dropoff_latitude if journey else None,
             'dropoff_longitude': journey.dropoff_longitude if journey else None
         }
+        
+        app.logger.info("🔧 Journey details response: %s", journey_details)
         
         return jsonify({
             'success': True,
@@ -1722,6 +2003,486 @@ def get_payment_details(payment_id):
     except Exception as e:
         app.logger.exception("Error fetching payment details:")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/emailtest', methods=['GET', 'POST'])
+def test_email():
+    """Test endpoint to send sample emails"""
+    try:
+        # Handle GET request for testing
+        if request.method == 'GET':
+            return jsonify({
+                "success": True,
+                "message": "Email test endpoint is working!",
+                "available_types": ["welcome", "pickup", "dropoff", "payment", "attendance"],
+                "email_config": {
+                    "server": app.config.get('MAIL_SERVER'),
+                    "port": app.config.get('MAIL_PORT'),
+                    "username": app.config.get('MAIL_USERNAME'),
+                    "use_tls": app.config.get('MAIL_USE_TLS'),
+                    "use_ssl": app.config.get('MAIL_USE_SSL')
+                }
+            })
+        
+        # Log the request details for debugging
+        app.logger.info(f"Email test request received from IP: {request.remote_addr}")
+        app.logger.info(f"Request headers: {dict(request.headers)}")
+        app.logger.info(f"Request content type: {request.content_type}")
+        
+        # Handle both JSON and form data
+        if request.content_type and 'application/json' in request.content_type:
+            data = request.get_json()
+        else:
+            # Try to parse form data
+            data = request.form.to_dict() if request.form else {}
+            if not data:
+                data = request.args.to_dict()
+        
+        app.logger.info(f"Parsed data: {data}")
+        
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        email_type = data.get('type', 'welcome')
+        recipient_email = data.get('email', 'daviddors12@gmail.com')
+        recipient_name = data.get('name', 'David')
+        
+        app.logger.info(f"Testing email type: {email_type} to: {recipient_email}")
+        
+        if email_type == 'welcome':
+            success = EmailService.send_welcome_email(recipient_email, recipient_name)
+        elif email_type == 'pickup':
+            success = EmailService.send_pickup_notification(
+                recipient_email, 
+                recipient_name, 
+                "Test Child", 
+                "Test Pickup Person", 
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
+        elif email_type == 'dropoff':
+            success = EmailService.send_dropoff_notification(
+                recipient_email,
+                recipient_name,
+                "Test Child",
+                "Test Location",
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
+        elif email_type == 'payment':
+            success = EmailService.send_payment_confirmation(
+                recipient_email,
+                recipient_name,
+                50.00,
+                "TEST_PAYMENT_123",
+                datetime.now().strftime("%Y-%m-%d")
+            )
+        elif email_type == 'attendance':
+            success = EmailService.send_attendance_notification(
+                recipient_email,
+                recipient_name,
+                "Test Child",
+                datetime.now().strftime("%Y-%m-%d"),
+                "Present"
+            )
+        elif email_type == 'journey_status':
+            success = EmailService.send_journey_status_notification(
+                recipient_email,
+                recipient_name,
+                "Test Child",
+                "Test Pickup Person",
+                "departed",
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
+        elif email_type == 'status_pending':
+            success = EmailService.send_journey_status_notification(
+                recipient_email,
+                recipient_name,
+                "Test Child",
+                "Test Pickup Person",
+                "pending",
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
+        elif email_type == 'status_departed':
+            success = EmailService.send_journey_status_notification(
+                recipient_email,
+                recipient_name,
+                "Test Child",
+                "Test Pickup Person",
+                "departed",
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
+        elif email_type == 'status_picked':
+            success = EmailService.send_journey_status_notification(
+                recipient_email,
+                recipient_name,
+                "Test Child",
+                "Test Pickup Person",
+                "picked",
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
+        else:
+            return jsonify({"error": "Invalid email type. Use: welcome, pickup, dropoff, payment, attendance, journey_status, status_pending, status_departed, status_picked"}), 400
+
+        if success:
+            return jsonify({
+                "success": True,
+                "message": f"{email_type} email sent successfully to {recipient_email}",
+                "email_type": email_type,
+                "recipient": recipient_email
+            }), 200
+        else:
+            return jsonify({
+                "success": False,
+                "message": f"Failed to send {email_type} email to {recipient_email}",
+                "email_type": email_type,
+                "recipient": recipient_email
+            }), 500
+            
+    except Exception as e:
+        app.logger.error(f"Error in email test: {str(e)}")
+        return jsonify({"error": f"Email test failed: {str(e)}"}), 500
+
+@app.route('/test_email_direct', methods=['POST'])
+def test_email_direct():
+    """Test email sending with hardcoded data"""
+    try:
+        app.logger.info("Starting direct email test...")
+        
+        # Test email sending with hardcoded data
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        app.logger.info("Calling EmailService.send_journey_status_notification...")
+        
+        # Send test email directly
+        success = EmailService.send_journey_status_notification(
+            "daviddors12@gmail.com",
+            "Test Parent",
+            "Test Child",
+            "Test Pickup Person",
+            "departed",
+            current_time,
+            "Direct test from backend"
+        )
+        
+        app.logger.info(f"Email service returned: {success}")
+        
+        if success:
+            return jsonify({
+                "success": True,
+                "message": "Test email sent directly to daviddors12@gmail.com",
+                "timestamp": current_time
+            }), 200
+        else:
+            return jsonify({
+                "success": False,
+                "message": "Failed to send test email"
+            }), 500
+            
+    except Exception as e:
+        app.logger.error(f"Direct email test failed: {str(e)}")
+        import traceback
+        app.logger.error(f"Direct email test traceback: {traceback.format_exc()}")
+        return jsonify({"error": f"Email test failed: {str(e)}"}), 500
+
+@app.route('/test_simple', methods=['GET'])
+def test_simple():
+    """Simple test endpoint"""
+    try:
+        app.logger.info("Simple test endpoint called")
+        return jsonify({
+            "success": True,
+            "message": "Simple test working",
+            "email_service_imported": "EmailService" in globals(),
+            "mail_imported": "mail" in globals()
+        }), 200
+    except Exception as e:
+        app.logger.error(f"Simple test failed: {str(e)}")
+        return jsonify({"error": f"Simple test failed: {str(e)}"}), 500
+
+@app.route('/create_test_data', methods=['POST'])
+def create_test_data():
+    """Create test data for mobile app"""
+    try:
+        app.logger.info("Creating test data for mobile app...")
+        
+        # Create test parent
+        test_parent = User(
+            id="parent-001",
+            name="Test Parent",
+            email="daviddors12@gmail.com",
+            phone="1234567890"
+        )
+        
+        # Create test child
+        test_child = Kid(
+            id="child-001",
+            name="Test Child",
+            parent_id="parent-001"
+        )
+        
+        # Create test pickup person
+        test_pickup_person = PickupPerson(
+            id="person-001",
+            name="Test Pickup Person",
+            phone="0987654321"
+        )
+        
+        # Add to database
+        db.session.add(test_parent)
+        db.session.add(test_child)
+        db.session.add(test_pickup_person)
+        db.session.commit()
+        
+        app.logger.info("Test data created successfully")
+        
+        return jsonify({
+            "success": True,
+            "message": "Test data created successfully",
+            "parent_id": "parent-001",
+            "child_id": "child-001", 
+            "pickup_person_id": "person-001"
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Failed to create test data: {str(e)}")
+        db.session.rollback()
+        return jsonify({"error": f"Failed to create test data: {str(e)}"}), 500
+
+@app.route('/api/check_data', methods=['GET'])
+def check_data():
+    """Check what data exists in the database"""
+    try:
+        app.logger.info("Checking database data...")
+        
+        # Get all users
+        users = User.query.all()
+        user_data = []
+        for user in users:
+            user_data.append({
+                'id': user.id,
+                'name': user.name,
+                'email': user.email,
+                'phone': user.phone,
+                'role': user.role
+            })
+        
+        # Get all kids
+        kids = Kid.query.all()
+        kid_data = []
+        for kid in kids:
+            kid_data.append({
+                'id': kid.id,
+                'name': kid.name,
+                'age': kid.age,
+                'grade': kid.grade,
+                'school': kid.school,
+                'parent_id': kid.parent_id
+            })
+        
+        # Get all pickup persons
+        pickup_persons = PickupPerson.query.all()
+        pickup_data = []
+        for person in pickup_persons:
+            pickup_data.append({
+                'id': person.id,
+                'name': person.name,
+                'phone': person.phone,
+                'uuid': person.uuid,
+                'is_active': person.is_active
+            })
+        
+        # Get all journeys
+        journeys = PickupJourney.query.all()
+        journey_data = []
+        for journey in journeys:
+            journey_data.append({
+                'pickup_id': journey.pickup_id,
+                'parent_id': journey.parent_id,
+                'child_id': journey.child_id,
+                'pickup_person_id': journey.pickup_person_id,
+                'status': journey.status,
+                'timestamp': journey.timestamp.isoformat() if journey.timestamp else None
+            })
+        
+        return jsonify({
+            'success': True,
+            'users': user_data,
+            'kids': kid_data,
+            'pickup_persons': pickup_data,
+            'journeys': journey_data,
+            'counts': {
+                'users': len(user_data),
+                'kids': len(kid_data),
+                'pickup_persons': len(pickup_data),
+                'journeys': len(journey_data)
+            }
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Failed to check data: {str(e)}")
+        return jsonify({"error": f"Failed to check data: {str(e)}"}), 500
+
+@app.route('/api/create_real_user', methods=['POST'])
+def create_real_user():
+    """Create a real user for mobile app testing"""
+    try:
+        data = request.get_json()
+        
+        # Create a real parent user
+        parent = User(
+            name=data.get('name', 'Real Parent'),
+            email=data.get('email', 'realparent@example.com'),
+            phone=data.get('phone', '1234567890'),
+            role='Parent'
+        )
+        
+        # Create a real child
+        child = Kid(
+            name=data.get('child_name', 'Real Child'),
+            age=data.get('child_age', 8),
+            grade=data.get('child_grade', '3rd Grade'),
+            school=data.get('child_school', 'Elementary School'),
+            parent_id=parent.id
+        )
+        
+        # Create a real pickup person
+        pickup_person = PickupPerson(
+            name=data.get('pickup_name', 'Real Pickup Person'),
+            phone=data.get('pickup_phone', '0987654321'),
+            uuid=data.get('pickup_uuid', 'real-uuid-123'),
+            is_active=True
+        )
+        
+        # Add to database
+        db.session.add(parent)
+        db.session.add(child)
+        db.session.add(pickup_person)
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Real user data created successfully',
+            'data': {
+                'parent_id': parent.id,
+                'child_id': child.id,
+                'pickup_person_id': pickup_person.id,
+                'parent_name': parent.name,
+                'child_name': child.name,
+                'pickup_name': pickup_person.name
+            }
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Failed to create real user: {str(e)}")
+        db.session.rollback()
+        return jsonify({"error": f"Failed to create real user: {str(e)}"}), 500
+
+@app.route('/api/get_existing_user', methods=['GET'])
+def get_existing_user():
+    """Get existing user data for mobile app"""
+    try:
+        # Find the existing user
+        user = User.query.filter_by(email='test22@gmail.com').first()
+        
+        if not user:
+            return jsonify({"error": "User test22@gmail.com not found"}), 404
+        
+        # Find associated kids
+        kids = Kid.query.filter_by(parent_id=user.id).all()
+        kid_data = []
+        for kid in kids:
+            kid_data.append({
+                'id': kid.id,
+                'name': kid.name,
+                'age': kid.age,
+                'grade': kid.grade,
+                'school': kid.school
+            })
+        
+        # Find pickup persons
+        pickup_persons = PickupPerson.query.filter_by(is_active=True).all()
+        pickup_data = []
+        for person in pickup_persons:
+            pickup_data.append({
+                'id': person.id,
+                'name': person.name,
+                'phone': person.phone,
+                'uuid': person.uuid
+            })
+        
+        return jsonify({
+            'success': True,
+            'user': {
+                'id': user.id,
+                'name': user.name,
+                'email': user.email,
+                'phone': user.phone,
+                'role': user.role
+            },
+            'kids': kid_data,
+            'pickup_persons': pickup_data,
+            'mobile_app_data': {
+                'parent_id': str(user.id),  # Convert to string for mobile app
+                'child_id': str(kids[0].id) if kids else None,
+                'pickup_person_id': str(pickup_persons[0].id) if pickup_persons else None
+            }
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Failed to get existing user: {str(e)}")
+        return jsonify({"error": f"Failed to get existing user: {str(e)}"}), 500
+
+@app.route('/api/setup_mobile_data', methods=['POST'])
+def setup_mobile_data():
+    """Setup real data for mobile app testing"""
+    try:
+        # Get existing user
+        user = User.query.filter_by(email='test22@gmail.com').first()
+        
+        if not user:
+            return jsonify({"error": "User test22@gmail.com not found"}), 404
+        
+        # Create a child for this user if it doesn't exist
+        child = Kid.query.filter_by(parent_id=user.id).first()
+        if not child:
+            child = Kid(
+                name="Test Child",
+                age=10,
+                grade="5th Grade",
+                school="Elementary School",
+                parent_id=user.id
+            )
+            db.session.add(child)
+            db.session.commit()
+        
+        # Create a pickup person if it doesn't exist
+        pickup_person = PickupPerson.query.filter_by(is_active=True).first()
+        if not pickup_person:
+            pickup_person = PickupPerson(
+                name="Test Driver",
+                phone="1234567890",
+                uuid="driver-uuid-123",
+                is_active=True
+            )
+            db.session.add(pickup_person)
+            db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Mobile app data setup complete',
+            'data': {
+                'parent_id': str(user.id),
+                'child_id': str(child.id),
+                'pickup_person_id': str(pickup_person.id),
+                'parent_name': user.name,
+                'child_name': child.name,
+                'pickup_name': pickup_person.name,
+                'parent_email': user.email
+            }
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Failed to setup mobile data: {str(e)}")
+        db.session.rollback()
+        return jsonify({"error": f"Failed to setup mobile data: {str(e)}"}), 500
 
 # Run server
 if __name__ == '__main__':

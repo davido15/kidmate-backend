@@ -3,3 +3,7 @@ flask_sqlalchemy
 flask_cors
 mysql-connector-python
 requests
+flask-mail
+flask-jwt-extended
+python-dotenv
+flask-migrate

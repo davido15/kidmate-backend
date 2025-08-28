@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../matekid"
+		},
+		{
+			"path": "../../../../Applications/MAMP/htdocs/KidMate"
+		}
+	],
+	"settings": {}
+}
