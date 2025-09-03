@@ -40,7 +40,7 @@ if not app.debug:
 
 # Configuration
 # Load environment variables (no defaults)
-DATABASE_URL = os.getenv('DATABASE_URL_LOCAL')
+DATABASE_URL = os.getenv('DATABASE_URL_LOCAL', 'mysql+pymysql://root:root@4.tcp.eu.ngrok.io:16396/kidmate_db')
 SECRET_KEY = os.getenv('SECRET_KEY')
 JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY')
 
@@ -1070,7 +1070,7 @@ def send_notification(token, message):
     headers = {"Content-Type": "application/json"}
     requests.post("https://exp.host/--/api/v2/push/send", json=payload, headers=headers)
 
-@app.route('/api/get-children', methods=['GET'])
+@app.route('/api/get-children', methods=['GET', 'POST'])
 @jwt_required()
 def get_children():
     """Get all children for the authenticated parent user"""
