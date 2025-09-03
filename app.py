@@ -1266,6 +1266,7 @@ def get_child_grades(child_id):
 @jwt_required()
 def get_child_summary(child_id):
     """Get comprehensive summary for a child including attendance and grades"""
+    app.logger.info("🔧 get_child_summary called for child_id: {}".format(child_id))
     try:
         current_user_email = get_jwt_identity()
         user = User.query.filter_by(email=current_user_email).first()
@@ -1285,178 +1286,144 @@ def get_child_summary(child_id):
         if not child:
             return jsonify({"error": "Child not found or not authorized"}), 404
         
-        # Get attendance and grades data
-        import pymysql
+        # Get attendance and grades data using SQLAlchemy models (same approach as get-children)
+        from datetime import datetime, timedelta
         
-        connection = pymysql.connect(
-            host='localhost',
-            port=8889,
-            user='root',
-            password='root',
-            database='kidmate_db'
-        )
+        app.logger.info("🔧 Starting child summary for child_id: {}".format(child_id))
         
-        with connection.cursor(pymysql.cursors.DictCursor) as cursor:
-            # Get recent attendance (last 30 days)
-            attendance_sql = """
-                SELECT id, date, status, check_in_time, check_out_time, notes
-                FROM attendance 
-                WHERE (child_id = %s OR child_name = %s)
-                AND date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
-                ORDER BY date DESC
-                LIMIT 1
-            """
-            try:
-                cursor.execute(attendance_sql, (str(child_id), child.name))
-                recent_attendance = cursor.fetchall()
-            except Exception as e:
-                app.logger.error("Error fetching attendance: {}".format(e))
-                recent_attendance = []
+        # Get recent attendance (last 30 days)
+        try:
+            thirty_days_ago = datetime.now() - timedelta(days=30)
+            app.logger.info("🔧 Fetching attendance for date >= {}".format(thirty_days_ago.date()))
             
-            # Get average grade summary
-            grades_sql = """
-                SELECT 
-                    'Average' as subject,
-                    CONCAT(ROUND(AVG(
-                        CASE 
-                            WHEN grade = 'A+' THEN 4.0
-                            WHEN grade = 'A' THEN 4.0
-                            WHEN grade = 'A-' THEN 3.7
-                            WHEN grade = 'B+' THEN 3.3
-                            WHEN grade = 'B' THEN 3.0
-                            WHEN grade = 'B-' THEN 2.7
-                            WHEN grade = 'C+' THEN 2.3
-                            WHEN grade = 'C' THEN 2.0
-                            WHEN grade = 'C-' THEN 1.7
-                            WHEN grade = 'D+' THEN 1.3
-                            WHEN grade = 'D' THEN 1.0
-                            WHEN grade = 'D-' THEN 0.7
-                            WHEN grade = 'F' THEN 0.0
-                            ELSE NULL
-                        END
-                    ), 1), '/4.0') as grade,
-                    CAST(CONCAT(COUNT(*), ' subjects') AS CHAR) as remarks,
-                    MAX(date_recorded) as date_recorded
-                FROM grades 
-                WHERE kid_id = %s
-                AND grade IN ('A+', 'A', 'A-', 'B+', 'B', 'B-', 'C+', 'C', 'C-', 'D+', 'D', 'D-', 'F')
-            """
+            recent_attendance = Attendance.query.filter(
+                (Attendance.child_id == str(child_id)) | (Attendance.child_name == child.name)
+            ).filter(Attendance.date >= thirty_days_ago.date()).order_by(Attendance.date.desc()).limit(1).all()
             
-            # Get highest grade
-            highest_grade_sql = """
-                SELECT 
-                    subject,
-                    grade,
-                    remarks,
-                    date_recorded
-                FROM grades 
-                WHERE kid_id = %s
-                ORDER BY 
-                    CASE 
-                        WHEN grade = 'A+' THEN 1
-                        WHEN grade = 'A' THEN 2
-                        WHEN grade = 'A-' THEN 3
-                        WHEN grade = 'B+' THEN 4
-                        WHEN grade = 'B' THEN 5
-                        WHEN grade = 'B-' THEN 6
-                        WHEN grade = 'C+' THEN 7
-                        WHEN grade = 'C' THEN 8
-                        WHEN grade = 'C-' THEN 9
-                        WHEN grade = 'D+' THEN 10
-                        WHEN grade = 'D' THEN 11
-                        WHEN grade = 'D-' THEN 12
-                        WHEN grade = 'F' THEN 13
-                        ELSE 14
-                    END ASC,
-                    date_recorded DESC
-                LIMIT 1
-            """
-            try:
-                cursor.execute(grades_sql, (child_id,))
-                average_grade = cursor.fetchone()
-                app.logger.info("Average grade fetched successfully: {}".format(average_grade))
-            except Exception as e:
-                app.logger.error("Error fetching average grade: {}".format(e))
-                app.logger.error("SQL query: {}".format(grades_sql))
-                app.logger.error("Child ID: {}".format(child_id))
-                average_grade = None
+            app.logger.info("🔧 Found {} attendance records".format(len(recent_attendance)))
+        except Exception as e:
+            app.logger.error("🔧 Error fetching attendance: {}".format(str(e)))
+            recent_attendance = []
+        
+        # Convert to list of dictionaries for JSON serialization
+        recent_attendance_list = []
+        for record in recent_attendance:
+            recent_attendance_list.append({
+                'id': record.id,
+                'date': record.date.isoformat() if record.date else None,
+                'status': record.status,
+                'check_in_time': record.check_in_time.isoformat() if record.check_in_time else None,
+                'check_out_time': record.check_out_time.isoformat() if record.check_out_time else None,
+                'notes': record.notes
+            })
+        
+        # Get grades data using SQLAlchemy (same approach as get-children)
+        try:
+            app.logger.info("🔧 Fetching grades for child_id: {}".format(child_id))
+            grades = Grade.query.filter_by(kid_id=child_id).all()
+            app.logger.info("🔧 Found {} grade records".format(len(grades)))
+        except Exception as e:
+            app.logger.error("🔧 Error fetching grades: {}".format(str(e)))
+            grades = []
+        
+        # Process grades data
+        app.logger.info("🔧 Processing {} grade records".format(len(grades)))
+        recent_grades = []
+        if grades:
+            # Get the highest grade by sorting
+            sorted_grades = sorted(grades, key=lambda x: (
+                {'A+': 1, 'A': 2, 'A-': 3, 'B+': 4, 'B': 5, 'B-': 6, 
+                 'C+': 7, 'C': 8, 'C-': 9, 'D+': 10, 'D': 11, 'D-': 12, 'F': 13}.get(x.grade, 14),
+                x.date_recorded or datetime.min
+            ))
+            
+            if sorted_grades:
+                highest_grade = sorted_grades[0]
+                recent_grades.append({
+                    'subject': highest_grade.subject,
+                    'grade': highest_grade.grade,
+                    'remarks': highest_grade.remarks,
+                    'date_recorded': highest_grade.date_recorded.isoformat() if highest_grade.date_recorded else None
+                })
+                app.logger.info("🔧 Highest grade: {} in {}".format(highest_grade.grade, highest_grade.subject))
+        
+        # Calculate attendance statistics using SQLAlchemy
+        app.logger.info("🔧 Calculating attendance statistics")
+        try:
+            attendance_count = Attendance.query.filter(
+                (Attendance.child_id == str(child_id)) | (Attendance.child_name == child.name)
+            ).filter(Attendance.date >= thirty_days_ago.date()).count()
+            
+            present_count = Attendance.query.filter(
+                (Attendance.child_id == str(child_id)) | (Attendance.child_name == child.name)
+            ).filter(Attendance.date >= thirty_days_ago.date()).filter(Attendance.status.in_(['Present', 'Checked In'])).count()
+            
+            absent_count = Attendance.query.filter(
+                (Attendance.child_id == str(child_id)) | (Attendance.child_name == child.name)
+            ).filter(Attendance.date >= thirty_days_ago.date()).filter(Attendance.status == 'Absent').count()
+            
+            late_count = Attendance.query.filter(
+                (Attendance.child_id == str(child_id)) | (Attendance.child_name == child.name)
+            ).filter(Attendance.date >= thirty_days_ago.date()).filter(Attendance.status == 'Late').count()
+            
+            app.logger.info("🔧 Attendance stats - Total: {}, Present: {}, Absent: {}, Late: {}".format(
+                attendance_count, present_count, absent_count, late_count
+            ))
+        except Exception as e:
+            app.logger.error("🔧 Error calculating attendance stats: {}".format(str(e)))
+            attendance_count = present_count = absent_count = late_count = 0
+        
+        # Calculate grade statistics using SQLAlchemy
+        app.logger.info("🔧 Calculating grade statistics")
+        try:
+            total_grades = len(grades)
+            if total_grades > 0:
+                # Convert grades to numeric values for calculations
+                grade_values = []
+                for grade_record in grades:
+                    grade = grade_record.grade
+                    if grade == 'A+': grade_values.append(4.0)
+                    elif grade == 'A': grade_values.append(4.0)
+                    elif grade == 'A-': grade_values.append(3.7)
+                    elif grade == 'B+': grade_values.append(3.3)
+                    elif grade == 'B': grade_values.append(3.0)
+                    elif grade == 'B-': grade_values.append(2.7)
+                    elif grade == 'C+': grade_values.append(2.3)
+                    elif grade == 'C': grade_values.append(2.0)
+                    elif grade == 'C-': grade_values.append(1.7)
+                    elif grade == 'D+': grade_values.append(1.3)
+                    elif grade == 'D': grade_values.append(1.0)
+                    elif grade == 'D-': grade_values.append(0.7)
+                    elif grade == 'F': grade_values.append(0.0)
                 
-            try:
-                cursor.execute(highest_grade_sql, (child_id,))
-                highest_grade = cursor.fetchone()
-                app.logger.info("Highest grade fetched successfully: {}".format(highest_grade))
-            except Exception as e:
-                app.logger.error("Error fetching highest grade: {}".format(e))
-                app.logger.error("SQL query: {}".format(highest_grade_sql))
-                app.logger.error("Child ID: {}".format(child_id))
-                highest_grade = None
-                
-            # Only return the highest grade
-            recent_grades = []
-            if highest_grade:
-                recent_grades.append(highest_grade)
+                if grade_values:
+                    average_grade = sum(grade_values) / len(grade_values)
+                    lowest_grade = min(grade_values)
+                    highest_grade = max(grade_values)
+                else:
+                    average_grade = lowest_grade = highest_grade = 0
+            else:
+                average_grade = lowest_grade = highest_grade = 0
             
-            # Calculate attendance statistics
-            attendance_stats_sql = """
-                SELECT 
-                    COUNT(*) as total_days,
-                    SUM(CASE WHEN status IN ('Present', 'Checked In') THEN 1 ELSE 0 END) as present_days,
-                    SUM(CASE WHEN status = 'Absent' THEN 1 ELSE 0 END) as absent_days,
-                    SUM(CASE WHEN status = 'Late' THEN 1 ELSE 0 END) as late_days
-                FROM attendance 
-                WHERE (child_id = %s OR child_name = %s)
-                AND date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
-            """
-            try:
-                cursor.execute(attendance_stats_sql, (str(child_id), child.name))
-                attendance_stats = cursor.fetchone()
-            except Exception as e:
-                app.logger.error("Error calculating attendance stats: {}".format(e))
-                attendance_stats = {'total_days': 0, 'present_days': 0, 'absent_days': 0, 'late_days': 0}
-            
-            # Calculate grade statistics
-            grades_stats_sql = """
-                SELECT 
-                    COUNT(*) as total_grades,
-                    AVG(
-                        CASE 
-                            WHEN grade = 'A+' THEN 4.0
-                            WHEN grade = 'A' THEN 4.0
-                            WHEN grade = 'A-' THEN 3.7
-                            WHEN grade = 'B+' THEN 3.3
-                            WHEN grade = 'B' THEN 3.0
-                            WHEN grade = 'B-' THEN 2.7
-                            WHEN grade = 'C+' THEN 2.3
-                            WHEN grade = 'C' THEN 2.0
-                            WHEN grade = 'C-' THEN 1.7
-                            WHEN grade = 'D+' THEN 1.3
-                            WHEN grade = 'D' THEN 1.0
-                            WHEN grade = 'D-' THEN 0.7
-                            WHEN grade = 'F' THEN 0.0
-                            ELSE NULL
-                        END
-                    ) as average_grade,
-                    MIN(grade) as lowest_grade,
-                    MAX(grade) as highest_grade
-                FROM grades 
-                WHERE kid_id = %s
-                AND grade IN ('A+', 'A', 'A-', 'B+', 'B', 'B-', 'C+', 'C', 'C-', 'D+', 'D', 'D-', 'F')
-            """
-            try:
-                cursor.execute(grades_stats_sql, (child_id,))
-                grades_stats = cursor.fetchone()
-            except Exception as e:
-                app.logger.error("Error calculating grades stats: {}".format(e))
-                grades_stats = {'total_grades': 0, 'average_grade': 0, 'lowest_grade': 0, 'highest_grade': 0}
-        
-        connection.close()
+            app.logger.info("🔧 Grade stats - Total: {}, Average: {:.1f}, Lowest: {:.1f}, Highest: {:.1f}".format(
+                total_grades, average_grade, lowest_grade, highest_grade
+            ))
+        except Exception as e:
+            app.logger.error("🔧 Error calculating grade stats: {}".format(str(e)))
+            total_grades = average_grade = lowest_grade = highest_grade = 0
         
         # Calculate attendance percentage
         attendance_percentage = 0
-        if attendance_stats and attendance_stats['total_days'] > 0:
-            attendance_percentage = round((attendance_stats['present_days'] / attendance_stats['total_days']) * 100, 1)
+        if attendance_count > 0:
+            attendance_percentage = round((present_count / attendance_count) * 100, 1)
         
-        return jsonify({
+        app.logger.info("🔧 Final calculations - Attendance %: {}, Grade average: {:.1f}".format(
+            attendance_percentage, average_grade
+        ))
+        
+        # Prepare response data
+        app.logger.info("🔧 Preparing response data")
+        response_data = {
             "success": True,
             "child": {
                 'id': child.id,
@@ -1465,24 +1432,30 @@ def get_child_summary(child_id):
                 'grade': child.grade,
                 'school': child.school
             },
-            "recent_attendance": recent_attendance,
+            "recent_attendance": recent_attendance_list,
             "recent_grades": recent_grades,
             "attendance_stats": {
-                'total_days': attendance_stats['total_days'] if attendance_stats else 0,
-                'present_days': attendance_stats['present_days'] if attendance_stats else 0,
-                'absent_days': attendance_stats['absent_days'] if attendance_stats else 0,
-                'late_days': attendance_stats['late_days'] if attendance_stats else 0,
+                'total_days': attendance_count,
+                'present_days': present_count,
+                'absent_days': absent_count,
+                'late_days': late_count,
                 'attendance_percentage': attendance_percentage
             },
             "grades_stats": {
-                'total_grades': grades_stats['total_grades'] if grades_stats else 0,
-                'average_grade': float(grades_stats['average_grade']) if grades_stats and grades_stats['average_grade'] else 0,
-                'lowest_grade': grades_stats['lowest_grade'] if grades_stats else 0,
-                'highest_grade': grades_stats['highest_grade'] if grades_stats else 0
+                'total_grades': total_grades,
+                'average_grade': round(average_grade, 1),
+                'lowest_grade': round(lowest_grade, 1),
+                'highest_grade': round(highest_grade, 1)
             }
-        })
+        }
+        
+        app.logger.info("🔧 Response data prepared successfully")
+        return jsonify(response_data)
         
     except Exception as e:
+        app.logger.error("🔧 Error in get_child_summary: {}".format(str(e)))
+        import traceback
+        app.logger.error("🔧 Full traceback: {}".format(traceback.format_exc()))
         return jsonify({"error": str(e)}), 500
 
 
